@@ -1,0 +1,373 @@
+#!/usr/bin/env bash
+# com5740-mouse: CLI helper for a Bluetooth mouse on Linux (BlueZ).
+#
+# Works with any Bluetooth mouse: the target is resolved from MOUSE_MAC or
+# auto-detected from devices advertising the "input-mouse" icon in BlueZ.
+#
+# Usage:
+#   com5740-mouse                # connect (and verify X11 detection)
+#   com5740-mouse status         # detailed status
+#   com5740-mouse reconnect      # recover the connection if it dropped
+#   com5740-mouse disconnect
+#   com5740-mouse toggle
+#   com5740-mouse pair [MAC]     # scan, pair and connect (pairing mode)
+#   com5740-mouse scan           # scan for 20 s and list detected mice
+#   com5740-mouse -h|--help
+#
+# Environment variables:
+#   MOUSE_MAC         Bluetooth address (skips auto-detection)
+#   MOUSE_NAME        Display name used in messages
+#   MOUSE_XNAME       X11 input device name (default: "<NAME> Mouse")
+#   MOUSE_RETRIES     Connection attempts (default: 4)
+#   MOUSE_DELAY       Seconds between attempts (default: 2)
+#   MOUSE_BT_TIMEOUT  Timeout per bluetoothctl call (default: 10)
+#
+# Note: disconnect/toggle put the mouse to sleep; move it or click to wake it up.
+
+set -uo pipefail
+
+# Target and tunable parameters (all overridable via environment variables).
+MAC="${MOUSE_MAC:-}"
+NAME="${MOUSE_NAME:-}"
+XNAME="${MOUSE_XNAME:-}"
+RETRIES="${MOUSE_RETRIES:-4}"
+DELAY="${MOUSE_DELAY:-2}"
+BT_TIMEOUT="${MOUSE_BT_TIMEOUT:-10}"
+
+# Colored logging helpers. All output goes to stdout except errors (stderr).
+info() { printf '\033[1;34m[mouse]\033[0m %s\n' "$*"; }
+ok()   { printf '\033[1;32m[mouse]\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m[mouse]\033[0m %s\n' "$*"; }
+err()  { printf '\033[1;31m[mouse]\033[0m %s\n' "$*" >&2; }
+
+# Exit early if a required external command is missing.
+need() {
+  command -v "$1" >/dev/null 2>&1 || { err "missing required command '$1'"; exit 127; }
+}
+
+# Return success only for a positive decimal integer (rejects empty, 0,
+# negatives and anything containing non-digit characters).
+is_pos_int() { case "$1" in ''|*[!0-9]*|0) return 1 ;; *) return 0 ;; esac; }
+
+# Validate numeric parameters before doing any work, so a bad value can never
+# produce weird retry loops or a zero/negative timeout.
+validate_params() {
+  is_pos_int "$RETRIES"    || { err "MOUSE_RETRIES must be an integer > 0 (got: '$RETRIES')"; exit 64; }
+  is_pos_int "$DELAY"      || { err "MOUSE_DELAY must be an integer > 0 (got: '$DELAY')"; exit 64; }
+  is_pos_int "$BT_TIMEOUT" || { err "MOUSE_BT_TIMEOUT must be an integer > 0 (got: '$BT_TIMEOUT')"; exit 64; }
+}
+
+# Wrapper around bluetoothctl: always bounded by a timeout so no call can hang
+# (some mice go to sleep when disconnected and bluetoothctl may wait long).
+bt() { timeout "$BT_TIMEOUT" bluetoothctl "$@" 2>/dev/null; }
+
+# Connection/paired state, derived from `bluetoothctl info`. Returns failure
+# when no target is selected yet.
+is_connected() { [ -n "$MAC" ] && bt info "$MAC" | grep -q 'Connected: yes'; }
+is_paired()    { [ -n "$MAC" ] && bt info "$MAC" | grep -q 'Paired: yes'; }
+
+# Return the X11 device id for this mouse, or nothing if it is not listed.
+xinput_id() {
+  [ -n "$XNAME" ] || return 0
+  xinput list 2>/dev/null | grep -F "$XNAME" | sed -n 's/.*id=\([0-9][0-9]*\).*/\1/p' | head -1
+}
+
+# Find the first known device that advertises a mouse profile.
+detect_mouse_mac() {
+  local mac icon
+  for mac in $(bt devices | awk '{print $2}'); do
+    icon=$(bt info "$mac" | sed -n 's/^\s*Icon: //p' | head -1)
+    if [ "$icon" = "input-mouse" ]; then
+      echo "$mac"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Resolve the target device: explicit MAC, otherwise auto-detect. Then derive
+# NAME and XNAME if they were not provided. Returns 1 when nothing is found.
+resolve_device() {
+  if [ -z "$MAC" ]; then
+    MAC=$(detect_mouse_mac) || true
+  fi
+  [ -n "$MAC" ] || return 1
+  if [ -z "$NAME" ]; then
+    NAME=$(bt info "$MAC" | sed -n 's/^\s*Name: //p' | head -1)
+    [ -n "$NAME" ] || NAME="$MAC"
+  fi
+  [ -n "$XNAME" ] || XNAME="$NAME Mouse"
+  return 0
+}
+
+# Same as resolve_device but aborts with a helpful message when no mouse exists.
+require_device() {
+  resolve_device || {
+    err "no Bluetooth mouse selected. Set MOUSE_MAC=<address> or run '$0 scan'."
+    exit 2
+  }
+}
+
+# Make sure the Bluetooth service is running and the adapter is unblocked and
+# powered on. Tries a non-interactive sudo only if the plain start fails.
+ensure_service() {
+  if ! systemctl is-active --quiet bluetooth; then
+    info "starting Bluetooth service..."
+    if ! systemctl start bluetooth 2>/dev/null; then
+      sudo -n systemctl start bluetooth 2>/dev/null || true
+    fi
+  fi
+  if ! systemctl is-active --quiet bluetooth; then
+    err "Bluetooth is not active. Run: sudo systemctl enable --now bluetooth"
+    return 1
+  fi
+  if command -v rfkill >/dev/null 2>&1; then
+    rfkill unblock bluetooth 2>/dev/null || true
+  fi
+  bt power on >/dev/null 2>&1 || true
+  return 0
+}
+
+# Poll the connection state for up to ~5 seconds after a connect attempt.
+wait_connected() {
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    is_connected && return 0
+    sleep 0.5
+  done
+  return 1
+}
+
+# Wait up to ~4 seconds for X11 to register the mouse, then report the result.
+# The Bluetooth link can be up slightly before the input device appears.
+show_xinput() {
+  local i id
+  for ((i = 0; i < 8; i++)); do
+    id=$(xinput_id)
+    [ -n "$id" ] && break
+    sleep 0.5
+  done
+  if [ -n "$id" ]; then
+    ok "X11 detects it as '$XNAME' (id=$id)."
+  else
+    warn "Bluetooth is connected, but X11 does not list '$XNAME' yet. Move the mouse."
+  fi
+}
+
+# Connect to the mouse, retrying a bounded number of times. Refuses to run if
+# the device has never been paired (use `pair` for that).
+cmd_connect() {
+  ensure_service || exit 1
+  require_device
+
+  if is_connected; then
+    ok "$NAME is already connected."
+    show_xinput
+    return 0
+  fi
+
+  if ! is_paired; then
+    err "$NAME is not paired. Put it in pairing mode and run: $0 pair $MAC"
+    exit 2
+  fi
+
+  bt trust "$MAC" >/dev/null 2>&1 || true
+
+  local i
+  for ((i = 1; i <= RETRIES; i++)); do
+    info "connecting $NAME (attempt $i/$RETRIES)..."
+    bt connect "$MAC" >/dev/null 2>&1 || true
+    if wait_connected; then
+      ok "$NAME connected."
+      show_xinput
+      return 0
+    fi
+    sleep "$DELAY"
+  done
+
+  err "could not connect to $NAME."
+  warn "Power it on or move it to wake it up, then try again."
+  exit 1
+}
+
+# Disconnect the mouse, retrying a bounded number of times. Avoids an extra
+# trailing delay after the final failed attempt.
+cmd_disconnect() {
+  require_device
+
+  if ! is_connected; then
+    info "$NAME is not connected."
+    return 0
+  fi
+
+  local i
+  for ((i = 1; i <= RETRIES; i++)); do
+    bt disconnect "$MAC" >/dev/null 2>&1 || true
+    sleep 0.5
+    if ! is_connected; then
+      ok "$NAME disconnected."
+      return 0
+    fi
+    [ "$i" -lt "$RETRIES" ] && sleep "$DELAY"
+  done
+
+  err "could not disconnect $NAME."
+  exit 1
+}
+
+# Flip the current state: disconnect if connected, connect otherwise.
+cmd_toggle() {
+  require_device
+  if is_connected; then cmd_disconnect; else cmd_connect; fi
+}
+
+# Recovery command. It intentionally does NOT disconnect first: many mice go to
+# sleep when the link drops and only respond again once moved/touched, so
+# disconnecting would leave them unreachable. It only reconnects if needed.
+cmd_reconnect() {
+  require_device
+  if is_connected; then
+    info "$NAME is already connected."
+    show_xinput
+    return 0
+  fi
+  cmd_connect
+}
+
+# Print a human-readable summary: service state, rfkill state, BlueZ properties
+# and whether X11 currently sees the mouse.
+cmd_status() {
+  echo "Bluetooth service:"
+  if systemctl is-active --quiet bluetooth; then
+    echo "  state: active"
+  else
+    echo "  state: INACTIVE"
+  fi
+
+  if command -v rfkill >/dev/null 2>&1; then
+    rfkill list bluetooth 2>/dev/null | sed 's/^/  /' || true
+  fi
+  echo ""
+
+  resolve_device || true
+
+  if [ -z "$MAC" ]; then
+    warn "no Bluetooth mouse selected. Set MOUSE_MAC=<address> or run '$0 scan'."
+    return 1
+  fi
+
+  echo "Device: $NAME ($MAC)"
+  echo ""
+
+  # Cache the info output so we do not query BlueZ twice.
+  local info_out
+  info_out=$(bt info "$MAC")
+  if [ -z "$info_out" ]; then
+    warn "Device not found in BlueZ (was it ever paired?)."
+    return 1
+  fi
+
+  # Show only the interesting BlueZ properties.
+  printf '%s\n' "$info_out" | grep -E '^\s*(Name|Alias|Icon|Paired|Bonded|Trusted|Blocked|Connected):' | sed 's/^\s*/  /'
+
+  local id
+  id=$(xinput_id)
+  echo ""
+  if [ -n "$id" ]; then
+    echo "X11: $XNAME (id=$id)"
+  else
+    echo "X11: not listed"
+  fi
+}
+
+# Pairing workflow for a mouse that is not yet known to BlueZ: scan, verify it
+# showed up, then pair, trust and connect. The address can be passed as an
+# argument or provided via MOUSE_MAC.
+cmd_pair() {
+  [ -n "${1:-}" ] && MAC="$1"
+  need bluetoothctl
+  ensure_service || exit 1
+
+  if [ -z "$MAC" ]; then
+    err "pass the mouse address: $0 pair <MAC> (use '$0 scan' to find it)."
+    exit 2
+  fi
+  resolve_device || true
+
+  warn "Put $NAME ($MAC) in pairing mode (button/wheel for 3-5 s)."
+  info "scanning for 30 s..."
+  timeout 35 bluetoothctl --timeout 30 scan on >/dev/null 2>&1 || true
+
+  if ! bt info "$MAC" | grep -q 'Name:'; then
+    err "$NAME did not show up. Move it closer, enable pairing mode and retry."
+    exit 1
+  fi
+
+  info "pairing..."
+  bt pair "$MAC" >/dev/null 2>&1 || true
+  bt trust "$MAC" >/dev/null 2>&1 || true
+  bt connect "$MAC" >/dev/null 2>&1 || true
+
+  if wait_connected; then
+    ok "$NAME paired and connected."
+    show_xinput
+  else
+    err "pairing could not be completed."
+    exit 1
+  fi
+}
+
+# Scan for nearby devices and list only those advertising a mouse profile.
+# `bluetoothctl info` is fetched once per device and reused for icon and name.
+cmd_scan() {
+  need bluetoothctl
+  ensure_service || exit 1
+
+  info "scanning for 20 s..."
+  timeout 25 bluetoothctl --timeout 20 scan on >/dev/null 2>&1 || true
+
+  echo ""
+  echo "Devices advertising a mouse profile:"
+  local found=0 mac icon info_out name
+  for mac in $(bt devices | awk '{print $2}'); do
+    info_out=$(bt info "$mac")
+    icon=$(printf '%s\n' "$info_out" | sed -n 's/^\s*Icon: //p' | head -1)
+    if [ "$icon" = "input-mouse" ]; then
+      name=$(printf '%s\n' "$info_out" | sed -n 's/^\s*Name: //p' | head -1)
+      printf '  %s  %s\n' "$mac" "$name"
+      found=1
+    fi
+  done
+  [ "$found" -eq 1 ] || echo "  (none; put the mouse in pairing mode and retry)"
+}
+
+# Print the header comment block (from line 2 up to the first non-comment line),
+# stripping the leading "# ". This keeps --help in sync with the file header.
+usage() {
+  awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
+}
+
+# Dispatch subcommands. No argument defaults to "connect".
+main() {
+  validate_params
+  case "${1:-connect}" in
+    connect|on)      cmd_connect ;;
+    disconnect|off)  cmd_disconnect ;;
+    toggle)          cmd_toggle ;;
+    reconnect)       cmd_reconnect ;;
+    status)          cmd_status ;;
+    pair)            shift; cmd_pair "$@" ;;
+    scan)            cmd_scan ;;
+    -h|--help|help)  usage ;;
+    *)
+      err "unknown command: $1"
+      echo "Try: $0 --help"
+      exit 64
+      ;;
+  esac
+}
+
+# Verify required dependencies and run.
+need bluetoothctl
+need timeout
+main "$@"
